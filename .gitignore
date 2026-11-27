@@ -1,0 +1,28 @@
+# Entorno virtual
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Editor / sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Archivos generados por el solver (PuLP/CBC)
+*.lp
+*.mps
+*.sol
+*.log
+
+# Temporales de Word/LaTeX si guardan el informe en el repo
+~$*
+*.aux
+*.out
+*.toc
