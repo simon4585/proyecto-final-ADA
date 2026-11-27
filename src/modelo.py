@@ -1,8 +1,17 @@
+# src/modelo.py
 from dataclasses import dataclass
 
 import pulp
 
 from src.dominio import Escenario
+
+
+def _crear_variable(prob: pulp.LpProblem, nombre: str, categoria: str):
+    #Crea una variable no negativa dentro del problema.
+    
+    if hasattr(prob, "add_variable"):
+        return prob.add_variable(nombre, 0, None, categoria)
+    return pulp.LpVariable(nombre, lowBound=0, cat=categoria)
 
 
 @dataclass
@@ -16,11 +25,11 @@ class ModeloConstruido:
 
     @property
     def num_variables(self) -> int:
-        return len(self.problema.variables())
+        return self.problema.numVariables()
 
     @property
     def num_restricciones(self) -> int:
-        return len(self.problema.constraints)
+        return self.problema.numConstraints()
 
 
 def construir_modelo(esc: Escenario) -> ModeloConstruido:
@@ -57,8 +66,8 @@ def construir_modelo(esc: Escenario) -> ModeloConstruido:
                 if dem(z, t) <= 0:
                     continue
                 categoria = pulp.LpInteger if t.indivisible else pulp.LpContinuous
-                x[(c.nombre, z.nombre, t.nombre)] = pulp.LpVariable(
-                    f"x_{ci}_{zi}_{ti}", lowBound=0, cat=categoria
+                x[(c.nombre, z.nombre, t.nombre)] = _crear_variable(
+                    prob, f"x_{ci}_{zi}_{ti}", categoria
                 )
 
     # n[z,t]: demanda no atendida
@@ -66,8 +75,8 @@ def construir_modelo(esc: Escenario) -> ModeloConstruido:
     for zi, z in enumerate(esc.zonas):
         for ti, t in enumerate(esc.tipos):
             if dem(z, t) > 0:
-                n[(z.nombre, t.nombre)] = pulp.LpVariable(
-                    f"n_{zi}_{ti}", lowBound=0, cat=pulp.LpContinuous
+                n[(z.nombre, t.nombre)] = _crear_variable(
+                    prob, f"n_{zi}_{ti}", pulp.LpContinuous
                 )
 
     # ---------- Calibración de eps ----------
