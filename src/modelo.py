@@ -1,152 +1,108 @@
-# src/modelo.py
 from dataclasses import dataclass
 
 import pulp
 
 from src.dominio import Escenario
 
-
-def _crear_variable(prob: pulp.LpProblem, nombre: str, categoria: str):
-    #Crea una variable no negativa dentro del problema.
-    
-    if hasattr(prob, "add_variable"):
-        return prob.add_variable(nombre, 0, None, categoria)
-    return pulp.LpVariable(nombre, lowBound=0, cat=categoria)
-
-
 @dataclass
 class ModeloConstruido:
-    """Resultado de construir el modelo: lo que necesita el solver y el intérprete."""
     problema: pulp.LpProblem
     x: dict            # (centro, zona, tipo) -> variable de envío
     n: dict            # (zona, tipo) -> variable de demanda no atendida
-    eps: float         # peso del costo en la función objetivo
     escenario: Escenario
 
     @property
-    def num_variables(self) -> int:
+    def num_variables(self):
         return self.problema.numVariables()
 
     @property
-    def num_restricciones(self) -> int:
+    def num_restricciones(self):
         return self.problema.numConstraints()
 
 
 def construir_modelo(esc: Escenario) -> ModeloConstruido:
-    prob = pulp.LpProblem("Distribucion_Ayudas_Humanitarias", pulp.LpMinimize)
+    prob = pulp.LpProblem("ayudas_humanitarias", pulp.LpMinimize)
 
-    # ---------- Parámetros (se leen del escenario) ----------
-    def inv(c, t):
-        return c.inventario.get(t.nombre, 0) if c.activo else 0
+    centros = [c.nombre for c in esc.centros]
+    zonas = [z.nombre for z in esc.zonas]
+    tipos = [t.nombre for t in esc.tipos]
 
-    def reserva(c, t):
-        return c.reserva.get(t.nombre, 0)
-
-    def dem(z, t):
-        return z.demanda.get(t.nombre, 0)
-
-    def ruta_disponible(c, z):
-        r = esc.ruta_entre(c.nombre, z.nombre)
-        return r is not None and r.disponible
-
-    def cap_ruta(c, z):
-        r = esc.ruta_entre(c.nombre, z.nombre)
-        return r.capacidad if r is not None else 0
-
-    def costo(c, z):
-        r = esc.ruta_entre(c.nombre, z.nombre)
-        return r.costo if r is not None else 0
-
-    # ---------- Variables de decisión ----------
-    # x[c,z,t]: solo se crean para pares (z,t) con demanda > 0
-    x = {}
-    for ci, c in enumerate(esc.centros):
-        for zi, z in enumerate(esc.zonas):
-            for ti, t in enumerate(esc.tipos):
-                if dem(z, t) <= 0:
-                    continue
-                categoria = pulp.LpInteger if t.indivisible else pulp.LpContinuous
-                x[(c.nombre, z.nombre, t.nombre)] = _crear_variable(
-                    prob, f"x_{ci}_{zi}_{ti}", categoria
-                )
-
-    # n[z,t]: demanda no atendida
-    n = {}
-    for zi, z in enumerate(esc.zonas):
-        for ti, t in enumerate(esc.tipos):
-            if dem(z, t) > 0:
-                n[(z.nombre, t.nombre)] = _crear_variable(
-                    prob, f"n_{zi}_{ti}", pulp.LpContinuous
-                )
-
-    # ---------- Calibración de eps ----------
-    # Cota superior del costo total y menor mejora de cobertura por una unidad
-    costo_max = 0.0
+    # ----- Parámetros del modelo, guardados en diccionarios -----
+    inv, reserva, desp = {}, {}, {}
     for c in esc.centros:
-        for z in esc.zonas:
-            for t in esc.tipos:
-                if dem(z, t) > 0 and ruta_disponible(c, z):
-                    ub = min(inv(c, t), cap_ruta(c, z), dem(z, t))
-                    costo_max += costo(c, z) * ub
+        desp[c.nombre] = c.capacidad_despacho
+        for t in tipos:
+            inv[c.nombre, t] = c.inventario.get(t, 0) if c.activo else 0
+            reserva[c.nombre, t] = c.reserva.get(t, 0)
 
-    mejoras = [
-        esc.prioridad_de(z).peso / dem(z, t)
-        for z in esc.zonas for t in esc.tipos if dem(z, t) > 0
-    ]
-    eps = 0.5 * min(mejoras) / costo_max if costo_max > 0 and mejoras else 0.0
+    dem = {}
+    peso, critica = {}, {}
+    for z in esc.zonas:
+        p = esc.prioridad_de(z)
+        peso[z.nombre] = p.peso
+        critica[z.nombre] = p.critica
+        for t in tipos:
+            dem[z.nombre, t] = z.demanda.get(t, 0)
 
-    # ---------- Función objetivo ----------
-    no_atendida_ponderada = pulp.lpSum(
-        esc.prioridad_de(z).peso * n[(z.nombre, t.nombre)] / dem(z, t)
-        for z in esc.zonas for t in esc.tipos if dem(z, t) > 0
-    )
-    costo_total = pulp.lpSum(
-        costo(c, z) * x[(c.nombre, z.nombre, t.nombre)]
-        for c in esc.centros for z in esc.zonas for t in esc.tipos
-        if dem(z, t) > 0
-    )
-    prob += no_atendida_ponderada + eps * costo_total, "Objetivo"
+    indivisible = {t.nombre: t.indivisible for t in esc.tipos}
 
-    # ---------- Restricciones ----------
-    for ci, c in enumerate(esc.centros):
-        # R1. Inventario disponible menos reserva mínima
-        for ti, t in enumerate(esc.tipos):
-            enviado = pulp.lpSum(
-                x[(c.nombre, z.nombre, t.nombre)]
-                for z in esc.zonas if dem(z, t) > 0
-            )
-            prob += enviado <= max(0, inv(c, t) - reserva(c, t)), f"R1_inventario_{ci}_{ti}"
+    # Una ruta bloqueada o que no existe tiene capacidad 0
+    cap, costo = {}, {}
+    for c in centros:
+        for z in zonas:
+            r = esc.ruta_entre(c, z)
+            cap[c, z] = r.capacidad if (r and r.disponible) else 0
+            costo[c, z] = r.costo if r else 0
 
-        # R2. Capacidad de despacho del centro
-        despachado = pulp.lpSum(
-            x[(c.nombre, z.nombre, t.nombre)]
-            for z in esc.zonas for t in esc.tipos if dem(z, t) > 0
-        )
-        prob += despachado <= c.capacidad_despacho, f"R2_despacho_{ci}"
+    # Solo hay variables para los pares (zona, tipo) con demanda
+    pares = [(z, t) for z in zonas for t in tipos if dem[z, t] > 0]
 
-        # R3. Capacidad de la ruta (si está bloqueada o no existe, el límite es 0)
-        for zi, z in enumerate(esc.zonas):
-            por_ruta = pulp.lpSum(
-                x[(c.nombre, z.nombre, t.nombre)]
-                for t in esc.tipos if dem(z, t) > 0
-            )
-            limite = cap_ruta(c, z) if ruta_disponible(c, z) else 0
-            prob += por_ruta <= limite, f"R3_ruta_{ci}_{zi}"
+    # ----- Variables -----
+    x = {}
+    for c in centros:
+        for z, t in pares:
+            categoria = pulp.LpInteger if indivisible[t] else pulp.LpContinuous
+            x[c, z, t] = prob.add_variable(f"x{len(x)}", 0, None, categoria)
 
-    for zi, z in enumerate(esc.zonas):
-        pr = esc.prioridad_de(z)
-        for ti, t in enumerate(esc.tipos):
-            if dem(z, t) <= 0:
-                continue
-            atendido = pulp.lpSum(x[(c.nombre, z.nombre, t.nombre)] for c in esc.centros)
+    n = {}
+    for z, t in pares:
+        n[z, t] = prob.add_variable(f"n{len(n)}", 0, None, pulp.LpContinuous)
 
-            # R4. Balance de demanda: atendido + no atendido = demanda
-            prob += atendido + n[(z.nombre, t.nombre)] == dem(z, t), f"R4_balance_{zi}_{ti}"
+    # ----- Valor de eps: el costo solo desempata, nunca le gana a la cobertura -----
+    costo_max = sum(costo[c, z] * min(inv[c, t], cap[c, z], dem[z, t]) for c, z, t in x)
+    mejora_minima = min((peso[z] / dem[z, t] for z, t in pares), default=0)
+    eps = 0.5 * mejora_minima / costo_max if costo_max > 0 else 0
 
-            # R5. Atención mínima en zonas críticas
-            if pr.critica:
-                prob += atendido >= esc.alfa * dem(z, t), f"R5_minimo_critico_{zi}_{ti}"
+    # ----- Función objetivo -----
+    no_atendida = pulp.lpSum(peso[z] * n[z, t] / dem[z, t] for z, t in pares)
+    costo_total = pulp.lpSum(costo[c, z] * x[c, z, t] for c, z, t in x)
+    prob += no_atendida + eps * costo_total
 
-    # R6 (no negatividad) y R7 (integralidad) van en la definición de las variables
+    # ----- Restricciones -----
+    for c in centros:
+        # R1: inventario (dejando la reserva mínima)
+        for t in tipos:
+            enviado = pulp.lpSum(x[c, z, t] for z in zonas if (z, t) in n)
+            prob += enviado <= max(0, inv[c, t] - reserva[c, t]), f"R1_inventario_{c}_{t}"
 
-    return ModeloConstruido(problema=prob, x=x, n=n, eps=eps, escenario=esc)
+        # R2: capacidad de despacho del centro
+        prob += pulp.lpSum(x[c, z, t] for z, t in pares) <= desp[c], f"R2_despacho_{c}"
+
+        # R3: capacidad de la ruta (si está bloqueada vale 0)
+        for z in zonas:
+            por_ruta = pulp.lpSum(x[c, z, t] for t in tipos if (z, t) in n)
+            prob += por_ruta <= cap[c, z], f"R3_ruta_{c}_{z}"
+
+    for z, t in pares:
+        atendido = pulp.lpSum(x[c, z, t] for c in centros)
+
+        # R4: atendido + no atendido = demanda
+        prob += atendido + n[z, t] == dem[z, t], f"R4_demanda_{z}_{t}"
+
+        # R5: atención mínima en zonas críticas
+        if critica[z]:
+            prob += atendido >= esc.alfa * dem[z, t], f"R5_minimo_critico_{z}_{t}"
+
+    # R6 (no negatividad) y R7 (enteras) están en la creación de las variables
+
+    return ModeloConstruido(prob, x, n, esc)
